@@ -49,14 +49,20 @@
 #undef MODULE_PARAM_PREFIX
 #define MODULE_PARAM_PREFIX "adreno."
 
-static const bool nopreempt = false;
-static const bool swfdetect = false;
+static bool nopreempt;
+module_param(nopreempt, bool, 0444);
+MODULE_PARM_DESC(nopreempt, "Disable GPU preemption");
+
+static bool swfdetect;
+module_param(swfdetect, bool, 0444);
+MODULE_PARM_DESC(swfdetect, "Enable soft fault detection");
 
 #define DRIVER_VERSION_MAJOR   3
 #define DRIVER_VERSION_MINOR   1
 
 #define KGSL_LOG_LEVEL_DEFAULT 0
 
+static void adreno_pwr_on_work(struct work_struct *work);
 static unsigned int counter_delta(struct kgsl_device *device,
 	unsigned int reg, unsigned int *counter);
 
@@ -97,7 +103,7 @@ static struct adreno_device device_3d0 = {
 	.ft_policy = KGSL_FT_DEFAULT_POLICY,
 	.ft_pf_policy = KGSL_FT_PAGEFAULT_DEFAULT_POLICY,
 	.long_ib_detect = 1,
-	.pwrctrl_flag = BIT(ADRENO_HWCG_CTRL) | BIT(ADRENO_THROTTLING_CTRL),
+	.pwrctrl_flag = BIT(ADRENO_HWCG_CTRL),
 	.profile.enabled = false,
 	.active_list = LIST_HEAD_INIT(device_3d0.active_list),
 	.active_list_lock = __SPIN_LOCK_UNLOCKED(device_3d0.active_list_lock),
@@ -108,6 +114,8 @@ static struct adreno_device device_3d0 = {
 		.skipsaverestore = 1,
 		.usesgmem = 1,
 	},
+	.pwr_on_work = __WORK_INITIALIZER(device_3d0.pwr_on_work,
+		adreno_pwr_on_work),
 };
 
 /* Ptr to array for the current set of fault detect registers */
@@ -356,6 +364,17 @@ void adreno_fault_detect_stop(struct adreno_device *adreno_dev)
 	}
 
 	adreno_dev->fast_hang_detect = 0;
+}
+
+static void adreno_pwr_on_work(struct work_struct *work)
+{
+	struct adreno_device *adreno_dev =
+		container_of(work, typeof(*adreno_dev), pwr_on_work);
+	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
+
+	mutex_lock(&device->mutex);
+	kgsl_pwrctrl_change_state(device, KGSL_STATE_ACTIVE);
+	mutex_unlock(&device->mutex);
 }
 
 /*
@@ -981,10 +1000,23 @@ static int adreno_of_get_power(struct adreno_device *adreno_dev,
 		&device->pwrctrl.pm_qos_active_latency))
 		device->pwrctrl.pm_qos_active_latency = 1000;
 
+	/* get pm-qos-cpu-mask-latency, set it to default if not found */
+	if (of_property_read_u32(node, "qcom,l2pc-cpu-mask-latency",
+		&device->pwrctrl.pm_qos_cpu_mask_latency))
+		device->pwrctrl.pm_qos_cpu_mask_latency = 1000;
+
 	/* get pm-qos-wakeup-latency, set it to default if not found */
 	if (of_property_read_u32(node, "qcom,pm-qos-wakeup-latency",
 		&device->pwrctrl.pm_qos_wakeup_latency))
-		device->pwrctrl.pm_qos_wakeup_latency = 101;
+		device->pwrctrl.pm_qos_wakeup_latency = 100;
+<<<<<<< HEAD
+
+	/* override these */
+	device->pwrctrl.pm_qos_active_latency = 1000;
+	device->pwrctrl.pm_qos_cpu_mask_latency = 1000;
+	device->pwrctrl.pm_qos_wakeup_latency = 100;
+=======
+>>>>>>> 8914168dd4d2 (msm: kgsl: Relax CPU latency requirements to save power)
 
 	/* override these */
 	device->pwrctrl.pm_qos_active_latency = 1000;
@@ -1234,9 +1266,6 @@ static int adreno_probe(struct platform_device *pdev)
 	if (adreno_dev->gpucore->cx_ipeak_gpu_freq)
 		device->pwrctrl.cx_ipeak_gpu_freq =
 				adreno_dev->gpucore->cx_ipeak_gpu_freq;
-
-	if (adreno_is_a6xx(adreno_dev))
-		device->mmu.features |= KGSL_MMU_SMMU_APERTURE;
 
 	status = kgsl_device_platform_probe(device);
 	if (status) {
@@ -1732,10 +1761,17 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 	/* make sure ADRENO_DEVICE_STARTED is not set here */
 	WARN_ON(test_bit(ADRENO_DEVICE_STARTED, &adreno_dev->priv));
 
+	/* disallow l2pc during wake up to improve GPU wake up time */
+	kgsl_pwrctrl_update_l2pc(&adreno_dev->dev,
+			KGSL_L2PC_WAKEUP_TIMEOUT);
+
 	pm_qos_update_request(&device->pwrctrl.pm_qos_req_dma,
 			pmqos_wakeup_vote);
 
 	regulator_left_on = regulators_left_on(device);
+
+	/* Clear any GPU faults that might have been left over */
+	adreno_clear_gpu_fault(adreno_dev);
 
 	/*
 	 * Keep high bus vote to reduce AHB latency
@@ -1771,14 +1807,6 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 	 * halted GPU transactions.
 	 */
 	adreno_deassert_gbif_halt(adreno_dev);
-
-	/*
-	 * Observed race between timeout fault (long IB detection) and
-	 * MISC hang (hard fault). MISC hang can be set while in recovery from
-	 * timeout fault. If fault flag is set in start path CP init fails.
-	 * Clear gpu fault to avoid such race.
-	 */
-	adreno_clear_gpu_fault(adreno_dev);
 
 	if (adreno_is_a640v1(adreno_dev)) {
 		ret = adreno_program_smmu_aperture(device);
@@ -3313,7 +3341,11 @@ int adreno_gmu_fenced_write(struct adreno_device *adreno_dev,
 		if (!(status & fence_mask))
 			return 0;
 		/* Wait a small amount of time before trying again */
-		udelay(GMU_CORE_WAKEUP_DELAY_US);
+		if (in_atomic())
+			udelay(GMU_CORE_WAKEUP_DELAY_US);
+		else
+			usleep_range(GMU_CORE_WAKEUP_DELAY_US,
+				     3 * GMU_CORE_WAKEUP_DELAY_US);
 
 		/* Try to write the fenced register again */
 		adreno_writereg(adreno_dev, offset, val);
