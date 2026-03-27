@@ -1,39 +1,106 @@
-name: Build
+name: build Stable
 
 on:
   workflow_dispatch:
-    # Inputs the workflow accepts
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-    - name: Checkout kernel source
-      uses: actions/checkout@v2
-      with:
-        submodules: recursive
+    - name: 🔄 Checkout Code
+      uses: actions/checkout@v4
 
-    - name: Checkout zipper
-      uses: actions/checkout@v2
-      with:
-        repository: Lafactorial/AnyKernel31
-        ref: sweetk6a
-        path: zipper
+    - name: 🔄 Init submodules
+      run: |
+        git submodule sync
+        git submodule update --init --recursive
 
-    - name: Android kernel build
-      uses: Lafactorial/android-kernel-actions@master
-      id: build
-      env:
-        NAME: MeMeDo
-      with:
-        arch: arm64
-        compiler: clang/15
-        defconfig: sweet_defconfig
-        image: Image
+    - name: ⏰ Prepare timezone
+      run: |
+        sudo rm /etc/localtime
+        sudo ln -s /usr/share/zoneinfo/Asia/Jakarta /etc/localtime
 
-    - name: Upload kernel
+    - name: 📦 Install Dependencies
+      run: |
+        sudo apt update -y
+        sudo apt install bc cpio flex bison aptitude git python-is-python3 tar aria2 perl wget curl lz4 libssl-dev zip -y
+
+    - name: 🔧 Clone Toolchains
+      run: |
+        mkdir clang && cd clang
+        curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+        chmod +x antman
+        ./antman -S
+        ./antman --patch=glibc
+        cd ..
+
+        git clone https://github.com/greenforce-project/gcc-arm64 -b main --depth=1 gcc64
+        git clone https://github.com/greenforce-project/gcc-arm -b main --depth=1 gcc32
+
+    - name: ⚙️ Setup Environment
+      run: |
+        echo "BUILD_TIME=$(TZ=Asia/Jakarta date '+%Y%m%d-%H%M')" >> $GITHUB_ENV
+        echo "CLANG_PATH=$GITHUB_WORKSPACE/clang" >> $GITHUB_ENV
+        echo "GCC64_PATH=$GITHUB_WORKSPACE/gcc64" >> $GITHUB_ENV
+        echo "GCC32_PATH=$GITHUB_WORKSPACE/gcc32" >> $GITHUB_ENV
+
+    - name: 📅 Set BUILD DATE
+      run: |
+        echo "BUILD_DATE='\"$(TZ=Asia/Jakarta date '+%b %d %Y')\"'" >> $GITHUB_ENV
+
+    - name: 🛠️ Build Kernel
+      run: |
+        export ARCH=arm64
+        export PATH="$CLANG_PATH/bin:$GCC64_PATH/bin:$GCC32_PATH/bin:$PATH"
+
+        # 🔥 Branding
+        export KBUILD_BUILD_USER=MiDoNaSR
+        export KBUILD_BUILD_HOST=MeMeDo
+        export LOCALVERSION="-MeMeDo"
+
+        export KBUILD_COMPILER_STRING="$CLANG_PATH/clang"
+        export BUILD_DATE=$BUILD_DATE
+        export CFLAGS_EXTRA="-DBUILD_DATE=$BUILD_DATE"
+
+        make O=out ARCH=arm64 sweet_defconfig
+
+        make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang \
+          CLANG_TRIPLE=$CLANG_PATH/aarch64-linux-gnu- \
+          CROSS_COMPILE=$GCC64_PATH/bin/aarch64-elf- \
+          CROSS_COMPILE_ARM32=$GCC32_PATH/bin/arm-eabi-
+
+        mv out/.config out/sweet_defconfig.txt
+
+    - name: 💾 Upload configs
       uses: actions/upload-artifact@v4
       with:
-          name: memedo
-          path: kernel/
-          compression-level: 0
+        name: configs-${{ env.BUILD_TIME }}
+        path: out/sweet_defconfig.txt
+
+    - name: 📦 Package Kernel (AnyKernel3)
+      run: |
+        ZIP_PREFIX="MeMeDo"
+        ZIPNAME="${ZIP_PREFIX}-sweet_k6a-${BUILD_TIME}.zip"
+
+        echo "Packaging → $ZIPNAME"
+
+        rm -rf AnyKernel3
+
+        git clone --depth=1 https://github.com/MiDoNaSR545/AnyKernel3 AnyKernel3 || \
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+
+        cp out/arch/arm64/boot/Image.gz AnyKernel3/ 2>/dev/null || true
+        cp out/arch/arm64/boot/dtbo.img AnyKernel3/ 2>/dev/null || true
+        cp out/arch/arm64/boot/dtb.img AnyKernel3/ 2>/dev/null || true
+
+        cd AnyKernel3
+        zip -r "../$ZIPNAME" *
+
+        echo "ZIPNAME=$ZIPNAME" >> $GITHUB_ENV
+
+    - name: 📤 Upload Flashable zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: MeMeDo-${{ github.ref_name }}-${{ env.BUILD_TIME }}
+        path: ${{ env.ZIPNAME }}
